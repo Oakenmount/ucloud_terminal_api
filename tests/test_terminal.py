@@ -1,5 +1,7 @@
 import unittest
 
+from ucloud_api.client import UCloudError
+from ucloud_api.machines import live_machines
 from ucloud_api.terminal import TerminalJobs, container_path, parse_ssh_endpoint
 
 APP = {
@@ -10,12 +12,21 @@ APP = {
                        ["shell", "enableTmux", "modules", "initScript", "batchScript", "extraArgs", "slurm", "numWeb"]],
     },
 }
+CPU_CAT = {"name": "cpu-amd-zen5", "provider": "ucloud", "accountingUnit": {"name": "Core"},
+           "accountingFrequency": "PERIODIC_MINUTE"}
+GPU_CAT = {"name": "gpu-nvidia-b200", "provider": "ucloud", "accountingUnit": {"name": "GPU"},
+           "accountingFrequency": "PERIODIC_MINUTE"}
 PRODUCTS = [
-    {"product": {"name": "cpu-amd-zen5-4-vcpu", "category": {"name": "cpu-amd-zen5", "provider": "ucloud"}}},
+    {"product": {"name": "cpu-amd-zen5-4-vcpu", "price": 4, "cpu": 4, "category": CPU_CAT},
+     "support": {"queueStatus": "AVAILABLE"}},
+    {"product": {"name": "gpu-nvidia-b200-1-mig.1g", "price": 1, "gpu": 1, "category": GPU_CAT,
+                 "fraction": {"numerator": 1, "denominator": 7}}, "support": {"queueStatus": "BUSY"}},
     {"product": {"name": "terminal", "category": {"name": "terminal", "provider": "ucloud"}}},
     {"product": {"name": "terminal", "category": {"name": "terminal", "provider": "sdu-odense"}}},
 ]
 DRIVES = [{"id": "123456", "specification": {"title": "Home"}}]
+# 600 core-minutes = 10 core-hours left on cpu-amd-zen5; nothing on the GPU category.
+WALLETS = [{"paysFor": CPU_CAT, "maxUsable": 600, "quota": 6000, "totalUsage": 5400}]
 
 
 class FakeClient:
@@ -29,6 +40,9 @@ class FakeClient:
 
     def browse_drives(self):
         return DRIVES
+
+    def wallets(self, product_type="COMPUTE"):
+        return WALLETS
 
 
 class TerminalTests(unittest.TestCase):
@@ -69,6 +83,27 @@ class TerminalTests(unittest.TestCase):
         self.assertEqual(spec["parameters"]["extraArgs"], {"type": "text", "value": "a b"})
         with self.assertRaises(ValueError):
             self.tj.build_spec("cpu-amd-zen5-4-vcpu", extra_parameters={"bogus": {}})
+
+    def test_live_machines(self):
+        ms = {m.name: m for m in live_machines(PRODUCTS, WALLETS)}
+        self.assertNotIn("terminal", ms)
+        cpu, mig = ms["cpu-amd-zen5-4-vcpu"], ms["gpu-nvidia-b200-1-mig.1g"]
+        self.assertEqual(cpu.price_per_hour, 4)
+        self.assertAlmostEqual(mig.price_per_hour, 1 / 7)
+        self.assertTrue(cpu.usable)
+        self.assertEqual(cpu.remaining_units, 10)
+        self.assertFalse(mig.usable)
+        self.assertEqual(mig.queue, "BUSY")
+
+    def test_preflight(self):
+        warnings = self.tj.preflight(self.tj.build_spec("cpu-amd-zen5-4-vcpu", hours=2))
+        self.assertIn("8 core-hours", warnings[0])
+        with self.assertRaises(UCloudError):   # 4/h x 3 h = 12 > 10 remaining
+            self.tj.preflight(self.tj.build_spec("cpu-amd-zen5-4-vcpu", hours=3))
+        with self.assertRaises(UCloudError):   # no GPU allocation
+            self.tj.preflight(self.tj.build_spec("gpu-nvidia-b200-1-mig.1g", hours=1))
+        self.assertEqual(len(self.tj.preflight(self.tj.build_spec("cpu-amd-zen5-4-vcpu", hours=3),
+                                               check_allocation=False)), 1)
 
 
 if __name__ == "__main__":

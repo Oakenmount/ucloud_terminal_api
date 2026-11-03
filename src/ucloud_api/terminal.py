@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from .client import UCloudClient, UCloudError
+from .machines import Machine, live_machines
 
 APP_NAME = "terminal-ubuntu"
 SSH_USER_DEFAULT = "ucloud"
@@ -50,6 +51,8 @@ class JobInfo:
     mounts: List[str] = field(default_factory=list)   # UCloud paths mounted into the job
     messages: List[str] = field(default_factory=list)
     url: str = ""
+    # UCloud folder that receives everything written to /work outside the mounted folders.
+    output_folder: Optional[str] = None
 
     @property
     def remaining_seconds(self) -> Optional[float]:
@@ -113,6 +116,34 @@ class TerminalJobs:
         if self._products is None:
             self._products = self.client.job_products()
         return self._products
+
+    def machines(self) -> List[Machine]:
+        """Live machine types merged with this workspace's allocations and queue status."""
+        return live_machines(self.products(), self.client.wallets())
+
+    def preflight(self, spec: Dict, check_allocation: bool = True) -> List[str]:
+        """Check the allocation and estimate the cost before submitting. Returns warnings, or raises."""
+        prod, t = spec["product"], spec["timeAllocation"]
+        hours = t["hours"] + t["minutes"] / 60
+        nodes = spec.get("replicas", 1)
+        m = next((x for x in self.machines() if x.name == prod["id"] and x.provider == prod["provider"]), None)
+        if m is None:
+            return []
+        cost = m.price_per_hour * hours * nodes
+        unit = {"Core": "core-hours", "GPU": "GPU-hours"}.get(m.unit, f"{m.unit}-hours")
+        warnings = [f"estimated cost: {cost:g} {unit} ({m.price_per_hour:g}/h x {hours:g} h x {nodes} node(s))"]
+        if m.remaining_units is not None:
+            warnings[0] += f"; remaining allocation for {m.category}: {m.remaining_units:,.0f} {unit}"
+        if check_allocation and not m.usable:
+            usable = sorted({x.category for x in self.machines() if x.usable})
+            raise UCloudError(402, f"No allocation for category '{m.category}' ({m.provider}) in this workspace. "
+                                   f"Categories you can use: {usable or 'none'}. See `ucloud balance`.")
+        if check_allocation and m.remaining_units is not None and cost > m.remaining_units:
+            raise UCloudError(402, f"Estimated cost {cost:g} {unit} exceeds the remaining allocation "
+                                   f"{m.remaining_units:,.0f} {unit} for {m.category}.")
+        if m.queue in ("BUSY", "FULL"):
+            warnings.append(f"queue status for {m.name} is {m.queue}; the job may wait in the queue")
+        return warnings
 
     def resolve_product(self, machine: str, provider: Optional[str] = None) -> Dict[str, str]:
         cands = [p["product"] for p in self.products()
@@ -192,9 +223,17 @@ class TerminalJobs:
             spec["name"] = name
         return spec
 
-    def launch(self, machine: str, wait: bool = False, wait_timeout: float = 900, **kwargs: Any) -> JobInfo:
-        """Submit a Terminal Ubuntu job with SSH enabled. See build_spec for arguments."""
+    def launch(self, machine: str, wait: bool = False, wait_timeout: float = 900,
+               check_allocation: bool = True, log=None, **kwargs: Any) -> JobInfo:
+        """Submit a Terminal Ubuntu job with SSH enabled. See build_spec for arguments.
+
+        Before submitting, it checks that the machine's category has enough allocation (disable with
+        check_allocation=False). Warnings, such as the cost estimate, go to ``log`` if one is given.
+        """
         spec = self.build_spec(machine, **kwargs)
+        for w in self.preflight(spec, check_allocation=check_allocation):
+            if log:
+                log(w)
         ids = self.client.create_jobs([spec])
         if not ids:
             raise UCloudError(500, "UCloud did not return a job id")
@@ -229,6 +268,7 @@ class TerminalJobs:
             mounts=mounts,
             messages=[u["status"] for u in job.get("updates") or [] if u.get("status")],
             url=f"{self.client.base_url}/app/jobs/properties/{job['id']}",
+            output_folder=(job.get("output") or {}).get("outputFolder"),
         )
 
     def wait(self, job_id: str, timeout: float = 900, poll: float = 5.0, ssh_ready: bool = True,

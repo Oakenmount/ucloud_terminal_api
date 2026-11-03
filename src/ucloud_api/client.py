@@ -29,7 +29,8 @@ class UCloudError(RuntimeError):
     def __init__(self, status: int, message: str, path: str = ""):
         self.status = status
         self.path = path
-        super().__init__(f"UCloud API error {status} on {path}: {message}")
+        self.message = message
+        super().__init__(f"UCloud API error {status} on {path}: {message}" if path else message)
 
 
 def load_token(token: Optional[str] = None) -> str:
@@ -126,6 +127,10 @@ class UCloudClient:
         for _provider, items in (resp.get("productsByProvider") or {}).items():
             out.extend(items)
         return out
+
+    def wallets(self, product_type: str = "COMPUTE") -> List[Dict]:
+        """Allocations of the active workspace (quota / usage / maxUsable per product category)."""
+        return list(self.browse_all("/api/accounting/v2/browseWallets", filterType=product_type))
 
     # ------------------------------------------------------------------ jobs
 
